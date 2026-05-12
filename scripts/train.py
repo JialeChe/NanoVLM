@@ -25,7 +25,7 @@ def main():
     parser.add_argument(
         "--data_path",
         type=str,
-        default="data/llava_instruct_sample.json",
+        default="./data/llava_pretrain/blip_laion_cc_sbu_558k.json",
         help="Path to training data (LLaVA format JSON)",
     )
     parser.add_argument(

@@ -1,12 +1,14 @@
 """
 NanoVLM 训练器
 支持两阶段训练：Stage1（仅训练MLP）+ Stage2（训练MLP + LLM LoRA）
+集成 TensorBoard 日志记录
 """
 
 import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from typing import Optional, Dict
@@ -38,6 +40,14 @@ class NanoVLMTrainer:
         # 输出目录
         self.output_dir = config.output_dir
         ensure_dir(self.output_dir)
+
+        # TensorBoard
+        if config.use_tensorboard:
+            log_dir = os.path.join(self.output_dir, "tb_logs")
+            self.writer = SummaryWriter(log_dir=log_dir)
+            print(f"[Trainer] TensorBoard logs will be saved to: {log_dir}")
+        else:
+            self.writer = None
 
     def _create_dataloader(
         self,
@@ -126,6 +136,11 @@ class NanoVLMTrainer:
 
         return optimizer, scheduler
 
+    def _log_tb(self, tag: str, value: float, step: int):
+        """记录标量到 TensorBoard"""
+        if self.writer is not None:
+            self.writer.add_scalar(tag, value, step)
+
     def train_stage1(self, stage1_config: Stage1Config = None):
         """
         Stage 1 训练：仅训练MLP投影层
@@ -143,6 +158,7 @@ class NanoVLMTrainer:
         print(f"  Batch size: {stage1_config.per_device_batch_size}")
         print(f"  Learning rate: {stage1_config.learning_rate}")
         print(f"  Gradient accumulation: {stage1_config.gradient_accumulation_steps}")
+        print(f"  TensorBoard: {'enabled' if self.writer else 'disabled'}")
         print("=" * 60)
 
         # 设置 Stage 1
@@ -170,9 +186,13 @@ class NanoVLMTrainer:
         )
 
         # 混合精度
-        scaler = torch.cuda.amp.GradScaler(enabled=stage1_config.use_fp16)
+        scaler = torch.amp.GradScaler('cuda', enabled=stage1_config.use_fp16)
+
+        # 保存一次静态文件（config + tokenizer），后续 checkpoint 不再重复保存
+        self.model.save_pretrained(self.output_dir)
 
         # 训练循环
+        stage_prefix = "stage1"
         for epoch in range(stage1_config.num_epochs):
             self.current_epoch = epoch
             epoch_loss = 0.0
@@ -189,7 +209,7 @@ class NanoVLMTrainer:
                     pixel_values = pixel_values.to(self.device)
 
                 # 混合精度前向传播
-                with torch.cuda.amp.autocast(enabled=stage1_config.use_fp16):
+                with torch.amp.autocast('cuda', enabled=stage1_config.use_fp16):
                     outputs = self.model(
                         pixel_values=pixel_values,
                         input_ids=input_ids,
@@ -207,7 +227,7 @@ class NanoVLMTrainer:
                 if (step + 1) % stage1_config.gradient_accumulation_steps == 0:
                     # 梯度裁剪
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         self.config.max_grad_norm,
                     )
@@ -220,6 +240,12 @@ class NanoVLMTrainer:
 
                     self.global_step += 1
 
+                    # TensorBoard 日志（实际优化步级）
+                    current_lr = scheduler.get_last_lr()[0]
+                    self._log_tb(f"{stage_prefix}/loss", loss.item() * stage1_config.gradient_accumulation_steps, self.global_step)
+                    self._log_tb(f"{stage_prefix}/lr", current_lr, self.global_step)
+                    self._log_tb(f"{stage_prefix}/grad_norm", grad_norm.item(), self.global_step)
+
                 # 日志
                 epoch_loss += loss.item() * stage1_config.gradient_accumulation_steps
                 avg_loss = epoch_loss / (step + 1)
@@ -230,14 +256,21 @@ class NanoVLMTrainer:
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                 })
 
-                # 定期保存
+                # 每 logging_steps 记录 (数据步级)
+                if (step + 1) % stage1_config.logging_steps == 0:
+                    current_lr = scheduler.get_last_lr()[0]
+                    self._log_tb(f"{stage_prefix}/loss_per_step", loss.item() * stage1_config.gradient_accumulation_steps, epoch * len(train_loader) + step)
+
+                # 定期保存（仅保存可训练权重，config/tokenizer 已在训练开始时保存）
                 if self.global_step > 0 and self.global_step % stage1_config.save_steps == 0:
                     save_path = os.path.join(self.output_dir, f"stage1_step_{self.global_step}")
-                    self.model.save_pretrained(save_path)
+                    self.model.save_pretrained(save_path, save_config=False, save_tokenizer=False)
+                    print(f"\n[Stage1] Checkpoint saved to: {save_path}")
 
             # Epoch 结束保存
             save_path = os.path.join(self.output_dir, f"stage1_epoch_{epoch+1}")
-            self.model.save_pretrained(save_path)
+            self.model.save_pretrained(save_path, save_config=False, save_tokenizer=False)
+            self._log_tb(f"{stage_prefix}/epoch_avg_loss", avg_loss, epoch + 1)
             print(f"\nStage 1 Epoch {epoch+1} completed. Avg loss: {avg_loss:.4f}")
 
         print("\nStage 1 training completed!")
@@ -260,6 +293,7 @@ class NanoVLMTrainer:
         print(f"  Batch size: {stage2_config.per_device_batch_size}")
         print(f"  Learning rate: {stage2_config.learning_rate}")
         print(f"  LoRA r={stage2_config.lora_r}, alpha={stage2_config.lora_alpha}")
+        print(f"  TensorBoard: {'enabled' if self.writer else 'disabled'}")
         print("=" * 60)
 
         # 设置 Stage 2
@@ -292,9 +326,14 @@ class NanoVLMTrainer:
         )
 
         # 混合精度
-        scaler = torch.cuda.amp.GradScaler(enabled=stage2_config.use_fp16)
+        scaler = torch.amp.GradScaler('cuda', enabled=stage2_config.use_fp16)
+
+        # 保存一次静态文件（config + tokenizer），后续 checkpoint 不再重复保存
+        # 注意：Stage 2 会额外保存 LoRA 权重到 checkpoint/lora/
+        self.model.save_pretrained(self.output_dir)
 
         # 训练循环
+        stage_prefix = "stage2"
         for epoch in range(stage2_config.num_epochs):
             self.current_epoch = epoch
             epoch_loss = 0.0
@@ -309,7 +348,7 @@ class NanoVLMTrainer:
                 if pixel_values is not None:
                     pixel_values = pixel_values.to(self.device)
 
-                with torch.cuda.amp.autocast(enabled=stage2_config.use_fp16):
+                with torch.amp.autocast('cuda', enabled=stage2_config.use_fp16):
                     outputs = self.model(
                         pixel_values=pixel_values,
                         input_ids=input_ids,
@@ -323,15 +362,22 @@ class NanoVLMTrainer:
 
                 if (step + 1) % stage2_config.gradient_accumulation_steps == 0:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         self.config.max_grad_norm,
                     )
+
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
                     scheduler.step()
                     self.global_step += 1
+
+                    # TensorBoard 日志（实际优化步级）
+                    current_lr = scheduler.get_last_lr()[0]
+                    self._log_tb(f"{stage_prefix}/loss", loss.item() * stage2_config.gradient_accumulation_steps, self.global_step)
+                    self._log_tb(f"{stage_prefix}/lr", current_lr, self.global_step)
+                    self._log_tb(f"{stage_prefix}/grad_norm", grad_norm.item(), self.global_step)
 
                 epoch_loss += loss.item() * stage2_config.gradient_accumulation_steps
                 avg_loss = epoch_loss / (step + 1)
@@ -340,12 +386,21 @@ class NanoVLMTrainer:
                     "avg_loss": f"{avg_loss:.4f}",
                 })
 
+                # 每 logging_steps 记录 (数据步级)
+                if (step + 1) % stage2_config.logging_steps == 0:
+                    current_lr = scheduler.get_last_lr()[0]
+                    self._log_tb(f"{stage_prefix}/loss_per_step", loss.item() * stage2_config.gradient_accumulation_steps, epoch * len(train_loader) + step)
+
+                # 定期保存（仅保存可训练权重，config/tokenizer 已在训练开始时保存；含 LoRA）
                 if self.global_step > 0 and self.global_step % stage2_config.save_steps == 0:
                     save_path = os.path.join(self.output_dir, f"stage2_step_{self.global_step}")
-                    self.model.save_pretrained(save_path)
+                    self.model.save_pretrained(save_path, save_config=False, save_tokenizer=False)
+                    print(f"\n[Stage2] Checkpoint saved to: {save_path}")
 
+            # Epoch 结束保存
             save_path = os.path.join(self.output_dir, f"stage2_epoch_{epoch+1}")
-            self.model.save_pretrained(save_path)
+            self.model.save_pretrained(save_path, save_config=False, save_tokenizer=False)
+            self._log_tb(f"{stage_prefix}/epoch_avg_loss", avg_loss, epoch + 1)
             print(f"\nStage 2 Epoch {epoch+1} completed. Avg loss: {avg_loss:.4f}")
 
         print("\nStage 2 training completed!")
@@ -390,7 +445,12 @@ class NanoVLMTrainer:
         if "stage2" in stages:
             self.train_stage2()
 
+        # 关闭 TensorBoard writer
+        if self.writer is not None:
+            self.writer.close()
+
         print("\n" + "=" * 60)
         print("Training completed!")
         print(f"Model saved to: {self.output_dir}")
+        print(f"TensorBoard logs: {os.path.join(self.output_dir, 'tb_logs')}")
         print("=" * 60)

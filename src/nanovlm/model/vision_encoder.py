@@ -50,7 +50,6 @@ class VisionEncoder(nn.Module):
         self.processor = AutoImageProcessor.from_pretrained(
             config.model_name_or_path,
             cache_dir=config.local_cache_dir,
-            use_fast=False,
             local_files_only=True
         )
 

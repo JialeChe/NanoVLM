@@ -56,6 +56,10 @@ class LanguageModelWrapper(nn.Module):
         self.config.hidden_size = self.hidden_size
         self._stage = "stage1"  # 当前训练阶段
 
+        # 启用 gradient checkpointing 以节省显存（用计算换内存）
+        self.model.gradient_checkpointing_enable()
+        print(f"[LanguageModel] Gradient checkpointing enabled")
+
     def set_stage(self, stage: str):
         """
         设置训练阶段，控制参数冻结/解冻

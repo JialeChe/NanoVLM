@@ -242,40 +242,72 @@ class NanoVLM(nn.Module):
         print(f"[NanoVLM] Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
         return trainable
 
-    def save_pretrained(self, save_dir: str):
-        """保存模型"""
+    def save_pretrained(self, save_dir: str, save_config: bool = True, save_tokenizer: bool = True):
+        """保存模型
+
+        Args:
+            save_dir: 保存目录
+            save_config: 是否保存 config.json（训练中不变的静态文件，只需保存一次）
+            save_tokenizer: 是否保存 tokenizer 文件（训练中不变的静态文件，只需保存一次）
+        """
         import os
         os.makedirs(save_dir, exist_ok=True)
 
         # 保存 connector (这是我们训练的主要部分)
         torch.save(self.connector.state_dict(), os.path.join(save_dir, "connector.bin"))
 
-        # 保存配置
-        import json
-        from dataclasses import asdict
-        config_dict = {
-            "vision": asdict(self.config.vision),
-            "language": asdict(self.config.language),
-            "connector": asdict(self.config.connector),
-            "image_token": self.config.image_token,
-            "image_token_id": self.config.image_token_id,
-        }
-        with open(os.path.join(save_dir, "config.json"), "w") as f:
-            json.dump(config_dict, f, indent=2)
+        # 保存 LoRA 权重（Stage 2）
+        try:
+            from peft import PeftModel
+            if isinstance(self.language_model.model, PeftModel):
+                lora_dir = os.path.join(save_dir, "lora")
+                self.language_model.model.save_pretrained(lora_dir)
+        except ImportError:
+            pass
 
-        # 保存 tokenizer
-        self.language_model.tokenizer.save_pretrained(save_dir)
+        # 保存配置（训练中不变，仅首次保存即可）
+        if save_config:
+            import json
+            from dataclasses import asdict
+            config_dict = {
+                "vision": asdict(self.config.vision),
+                "language": asdict(self.config.language),
+                "connector": asdict(self.config.connector),
+                "image_token": self.config.image_token,
+                "image_token_id": self.config.image_token_id,
+            }
+            with open(os.path.join(save_dir, "config.json"), "w") as f:
+                json.dump(config_dict, f, indent=2)
+
+        # 保存 tokenizer（训练中不变，仅首次保存即可）
+        if save_tokenizer:
+            self.language_model.tokenizer.save_pretrained(save_dir)
 
         print(f"[NanoVLM] Model saved to: {save_dir}")
 
     @classmethod
-    def from_pretrained(cls, save_dir: str, **kwargs):
-        """加载保存的模型"""
+    def from_pretrained(cls, save_dir: str, base_dir: str = None, **kwargs):
+        """加载保存的模型
+
+        Args:
+            save_dir: 模型保存目录（包含 connector.bin，可能也包含 config.json 和 tokenizer）
+            base_dir: 静态文件目录（config.json 和 tokenizer）。若 save_dir 中找不到则回退到此目录。
+                     默认与 save_dir 相同，兼容完整保存的 checkpoint。
+        """
         import os
         import json
 
-        # 加载配置
-        with open(os.path.join(save_dir, "config.json"), "r") as f:
+        # 查找 config.json：先在 save_dir 找，再回退到 base_dir
+        config_path = os.path.join(save_dir, "config.json")
+        if not os.path.exists(config_path) and base_dir is not None:
+            config_path = os.path.join(base_dir, "config.json")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(
+                f"config.json not found in {save_dir}"
+                + (f" or {base_dir}" if base_dir else "")
+            )
+
+        with open(config_path, "r") as f:
             config_dict = json.load(f)
 
         config = NanoVLMConfig(
@@ -294,5 +326,17 @@ class NanoVLM(nn.Module):
         if os.path.exists(connector_path):
             model.connector.load_state_dict(torch.load(connector_path, map_location="cpu"))
             print(f"[NanoVLM] Loaded connector from: {connector_path}")
+
+        # 加载 LoRA 权重（Stage 2）
+        lora_dir = os.path.join(save_dir, "lora")
+        if os.path.exists(lora_dir):
+            try:
+                from peft import PeftModel
+                model.language_model.model = PeftModel.from_pretrained(
+                    model.language_model.model, lora_dir
+                )
+                print(f"[NanoVLM] Loaded LoRA weights from: {lora_dir}")
+            except ImportError:
+                print("[NanoVLM] Warning: peft not installed, skipping LoRA loading")
 
         return model
