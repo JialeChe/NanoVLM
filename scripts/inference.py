@@ -1,10 +1,7 @@
-#!/usr/bin/env python3
 """
-NanoVLM 推理入口脚本
-用法:
+推理
     # 交互式对话
     python scripts/inference.py --model_path ./checkpoints/stage2_epoch_1 --interactive
-
     # 单次推理
     python scripts/inference.py --model_path ./checkpoints/stage2_epoch_1 --image cat.jpg --question "What is in this image?"
 """

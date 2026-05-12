@@ -1,9 +1,6 @@
-#!/usr/bin/env python3
 """
 NanoVLM 模型权重下载脚本
 下载 Vision Encoder (SigLIP) 和 Language Model (Qwen2) 的预训练权重
-
-用法:
     python scripts/download_models.py                    # 下载全部
     python scripts/download_models.py --vision_only      # 只下载 Vision
     python scripts/download_models.py --language_only    # 只下载 Language

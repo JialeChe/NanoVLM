@@ -1,0 +1,5 @@
+修复 SigLIP 视觉编码器调用，避免误走双塔模型入口要求 text input_ids。
+修复 Stage 1 语言模型 forward 对 connector 梯度链的 no_grad 截断问题。
+更新 test.py 使用 torch.amp.autocast 新接口。
+按已加载的 SigLIP 和 Qwen2 实际 hidden_size 自动同步 connector 输入输出维度，修复 729x1024 到 729x896 的 shape mismatch。
+将 from_pretrained 的 torch_dtype 改为 dtype，并显式固定 AutoImageProcessor 的 use_fast=False，消除当前运行警告。

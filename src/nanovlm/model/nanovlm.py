@@ -37,8 +37,12 @@ class NanoVLM(nn.Module):
 
         # 三大模块
         self.vision_encoder = VisionEncoder(config.vision)
-        self.connector = Connector(config.connector)
         self.language_model = LanguageModelWrapper(config.language)
+
+        # 用真实加载到的模型维度覆盖手工配置，避免本地权重与配置不一致。
+        self.config.connector.vision_hidden_size = self.vision_encoder.hidden_size
+        self.config.connector.llm_hidden_size = self.language_model.hidden_size
+        self.connector = Connector(config.connector)
 
         # 设置 <image> token
         self._setup_image_token()
@@ -86,12 +90,13 @@ class NanoVLM(nn.Module):
         # 1. 通过视觉编码器: (B, 3, H, W) → (B, num_patches+1, 1024)
         vision_features = self.vision_encoder(images)
 
-        # 2. 去掉 CLS token，只保留 patch tokens
-        #    vision_features[:, 0, :] = CLS
-        #    vision_features[:, 1:, :] = patches
-        patch_features = vision_features[:, 1:, :]  # (B, num_patches, 1024)
+        # CLIP 系列包含 CLS token，SigLIP 视觉塔通常直接返回 patch tokens。
+        if self.vision_encoder.has_cls_token:
+            patch_features = vision_features[:, 1:, :]
+        else:
+            patch_features = vision_features
 
-        # 3. 通过MLP投影到LLM空间: (B, num_patches, 1024) → (B, num_patches, 1536)
+        # 3. 通过MLP投影到LLM空间
         visual_embeddings = self.connector(patch_features)
 
         return visual_embeddings

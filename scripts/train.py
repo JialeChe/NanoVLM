@@ -9,7 +9,6 @@ import os
 import sys
 import argparse
 
-# 将项目根目录加入 path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
