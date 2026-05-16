@@ -54,12 +54,14 @@ class NanoVLMTrainer:
         dataset,
         batch_size: int,
         shuffle: bool = True,
+        sampler=None,
     ) -> DataLoader:
         """创建 DataLoader"""
         return DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=shuffle,
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
             num_workers=4,
             pin_memory=True,
             collate_fn=self._collate_fn,
@@ -136,17 +138,49 @@ class NanoVLMTrainer:
 
         return optimizer, scheduler
 
+    def _save_training_state(self, save_dir: str, optimizer, scheduler, scaler, step_in_epoch: int):
+        """保存优化器/调度器/混合精度缩放器等训练状态，用于断点续训"""
+        training_state = {
+            'global_step': self.global_step,
+            'current_epoch': self.current_epoch,
+            'step_in_epoch': step_in_epoch,
+        }
+        torch.save(training_state, os.path.join(save_dir, "training_state.pt"))
+        torch.save(optimizer.state_dict(), os.path.join(save_dir, "optimizer.pt"))
+        torch.save(scheduler.state_dict(), os.path.join(save_dir, "scheduler.pt"))
+        torch.save(scaler.state_dict(), os.path.join(save_dir, "scaler.pt"))
+
+    def _load_training_state(self, checkpoint_dir: str, optimizer, scheduler, scaler) -> int:
+        """加载训练状态，返回当前 epoch 内的 batch 位置"""
+        state = torch.load(os.path.join(checkpoint_dir, "training_state.pt"), map_location="cpu")
+        optimizer.load_state_dict(
+            torch.load(os.path.join(checkpoint_dir, "optimizer.pt"), map_location="cpu")
+        )
+        scheduler.load_state_dict(
+            torch.load(os.path.join(checkpoint_dir, "scheduler.pt"), map_location="cpu")
+        )
+        scaler.load_state_dict(
+            torch.load(os.path.join(checkpoint_dir, "scaler.pt"), map_location="cpu")
+        )
+        self.global_step = state['global_step']
+        self.current_epoch = state['current_epoch']
+        return state['step_in_epoch']
+
     def _log_tb(self, tag: str, value: float, step: int):
         """记录标量到 TensorBoard"""
         if self.writer is not None:
             self.writer.add_scalar(tag, value, step)
 
-    def train_stage1(self, stage1_config: Stage1Config = None):
+    def train_stage1(self, stage1_config: Stage1Config = None, resume_from: str = None):
         """
         Stage 1 训练：仅训练MLP投影层
 
         冻结：Vision Encoder + Language Model
         训练：Connector (MLP Projector)
+
+        Args:
+            stage1_config: Stage1 训练配置
+            resume_from: 断点续训的 checkpoint 目录路径（如 ./checkpoints/stage1_step_25000）
         """
         if stage1_config is None:
             stage1_config = self.config.stage1
@@ -159,6 +193,8 @@ class NanoVLMTrainer:
         print(f"  Learning rate: {stage1_config.learning_rate}")
         print(f"  Gradient accumulation: {stage1_config.gradient_accumulation_steps}")
         print(f"  TensorBoard: {'enabled' if self.writer else 'disabled'}")
+        if resume_from:
+            print(f"  Resume from: {resume_from}")
         print("=" * 60)
 
         # 设置 Stage 1
@@ -188,15 +224,71 @@ class NanoVLMTrainer:
         # 混合精度
         scaler = torch.amp.GradScaler('cuda', enabled=stage1_config.use_fp16)
 
+        # ---- 断点续训 ----
+        batches_to_skip = 0
+        if resume_from is not None:
+            connector_path = os.path.join(resume_from, "connector.bin")
+            if os.path.exists(connector_path):
+                self.model.connector.load_state_dict(
+                    torch.load(connector_path, map_location=self.device)
+                )
+                print(f"[Trainer] Loaded connector weights from: {connector_path}")
+            else:
+                print(f"[Warning] connector.bin not found in {resume_from}, skipping weight load")
+
+            state_path = os.path.join(resume_from, "training_state.pt")
+            opt_path = os.path.join(resume_from, "optimizer.pt")
+            if os.path.exists(state_path) and os.path.exists(opt_path):
+                self._load_training_state(
+                    resume_from, optimizer, scheduler, scaler
+                )
+                print(f"[Trainer] Resumed at global_step={self.global_step}, epoch={self.current_epoch}")
+            else:
+                # 旧版 checkpoint：尝试从目录名解析 step（如 stage1_step_25000）
+                import re
+                match = re.search(r'step[_\s](\d+)', os.path.basename(resume_from), re.IGNORECASE)
+                if match:
+                    self.global_step = int(match.group(1))
+                    print(f"[Trainer] Parsed global_step={self.global_step} from checkpoint path")
+                    print(f"[Trainer] Optimizer/scheduler will restart from scratch (LR schedule resets)")
+                else:
+                    print(f"[Trainer] Could not determine step; starting from beginning (global_step=0)")
+
+            batches_to_skip = self.global_step * stage1_config.gradient_accumulation_steps
+        # ---- 结束断点续训 ----
+
         # 保存一次静态文件（config + tokenizer），后续 checkpoint 不再重复保存
-        self.model.save_pretrained(self.output_dir)
+        if resume_from is None:
+            self.model.save_pretrained(self.output_dir)
+        else:
+            if not os.path.exists(os.path.join(self.output_dir, "config.json")):
+                self.model.save_pretrained(self.output_dir)
 
         # 训练循环
         stage_prefix = "stage1"
-        for epoch in range(stage1_config.num_epochs):
+        start_epoch = self.current_epoch
+        for epoch in range(start_epoch, stage1_config.num_epochs):
             self.current_epoch = epoch
             epoch_loss = 0.0
-            progress_bar = tqdm(train_loader, desc=f"Stage1 Epoch {epoch+1}/{stage1_config.num_epochs}")
+
+            # 断点续训首个 epoch：跳过已处理 batch；后续 epoch 使用全量数据
+            if batches_to_skip > 0 and epoch == start_epoch:
+                from torch.utils.data import SubsetRandomSampler
+                indices = list(range(batches_to_skip, len(self.train_dataset)))
+                epoch_loader = self._create_dataloader(
+                    self.train_dataset,
+                    batch_size=stage1_config.per_device_batch_size,
+                    sampler=SubsetRandomSampler(indices),
+                )
+                print(f"[Trainer] Skipping {batches_to_skip} batches, training on {len(indices)} remaining samples")
+            else:
+                epoch_loader = self._create_dataloader(
+                    self.train_dataset,
+                    batch_size=stage1_config.per_device_batch_size,
+                    shuffle=True,
+                )
+
+            progress_bar = tqdm(epoch_loader, desc=f"Stage1 Epoch {epoch+1}/{stage1_config.num_epochs}")
 
             for step, batch in enumerate(progress_bar):
                 # 将数据移到设备
@@ -261,15 +353,17 @@ class NanoVLMTrainer:
                     current_lr = scheduler.get_last_lr()[0]
                     self._log_tb(f"{stage_prefix}/loss_per_step", loss.item() * stage1_config.gradient_accumulation_steps, epoch * len(train_loader) + step)
 
-                # 定期保存（仅保存可训练权重，config/tokenizer 已在训练开始时保存）
+                # 定期保存（可训练权重 + 优化器/调度器状态，用于断点续训）
                 if self.global_step > 0 and self.global_step % stage1_config.save_steps == 0:
                     save_path = os.path.join(self.output_dir, f"stage1_step_{self.global_step}")
                     self.model.save_pretrained(save_path, save_config=False, save_tokenizer=False)
-                    print(f"\n[Stage1] Checkpoint saved to: {save_path}")
+                    self._save_training_state(save_path, optimizer, scheduler, scaler, step)
+                    print(f"\n[Stage1] Checkpoint saved to: {save_path} (step {self.global_step})")
 
             # Epoch 结束保存
             save_path = os.path.join(self.output_dir, f"stage1_epoch_{epoch+1}")
             self.model.save_pretrained(save_path, save_config=False, save_tokenizer=False)
+            self._save_training_state(save_path, optimizer, scheduler, scaler, step)
             self._log_tb(f"{stage_prefix}/epoch_avg_loss", avg_loss, epoch + 1)
             print(f"\nStage 1 Epoch {epoch+1} completed. Avg loss: {avg_loss:.4f}")
 
@@ -434,13 +528,13 @@ class NanoVLMTrainer:
             print("[Warning] peft not installed, skipping LoRA. Using full fine-tuning instead.")
             print("         Install with: pip install peft")
 
-    def train(self, stages: list = None):
+    def train(self, stages: list = None, resume_from_checkpoint: str = None):
         """完整训练流程"""
         if stages is None:
             stages = ["stage1", "stage2"]
 
         if "stage1" in stages:
-            self.train_stage1()
+            self.train_stage1(resume_from=resume_from_checkpoint)
 
         if "stage2" in stages:
             self.train_stage2()
