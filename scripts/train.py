@@ -69,6 +69,12 @@ def main():
         action="store_true",
         help="Create dummy training data for testing",
     )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Resume training from a checkpoint directory (e.g., checkpoints/stage1_step_55000)",
+    )
 
     args = parser.parse_args()
 
@@ -129,7 +135,7 @@ def main():
 
     # 开始训练
     stages = [s.strip() for s in args.stage.split(",")]
-    trainer.train(stages=stages)
+    trainer.train(stages=stages, resume_from_checkpoint=args.resume_from_checkpoint)
 
 
 if __name__ == "__main__":
