@@ -1,8 +1,15 @@
-# NanoVLM
+<h1 align="center">NanoVLM</h1>
 
-**NanoVLM** — 一个精简、可学习的 Vision-Language Model（视觉语言模型）。 约 **1B 总参数**， 在单张消费级 GPU 上即可完成两阶段训练。
+<p align="center">
+  <img src="https://img.shields.io/badge/PyTorch-2.0+-ee4c2c?logo=pytorch&logoColor=white" alt="PyTorch">
+  <img src="https://img.shields.io/badge/Python-3.8+-3776AB?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
+  <img src="https://img.shields.io/badge/Parameters-~1B-blue" alt="Parameters">
+</p>
 
-> 🎯 初衷：轻量 VLM，便于理解架构&训练流程
+<p align="center">
+  <b>精简可学习的视觉语言模型 · SigLIP + Qwen2-0.5B · 单卡消费级 GPU 即可完成两阶段训练</b>
+</p>
 
 ---
 
