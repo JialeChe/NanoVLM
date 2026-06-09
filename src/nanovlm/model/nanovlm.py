@@ -9,10 +9,11 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-from configs.model_config import NanoVLMConfig, VisionConfig, LanguageConfig, ConnectorConfig
+from configs.model_config import NanoVLMConfig, VisionConfig, LanguageConfig, ConnectorConfig, AnyResConfig
 from .vision_encoder import VisionEncoder
 from .language_model import LanguageModelWrapper
 from .connector import Connector
+from .anyres_processor import AnyResProcessor
 
 
 class NanoVLM(nn.Module):
@@ -44,8 +45,22 @@ class NanoVLM(nn.Module):
         self.config.connector.llm_hidden_size = self.language_model.hidden_size
         self.connector = Connector(config.connector)
 
+        # 对齐 Connector dtype 与语言模型一致（FP16），避免 Half+Float 混算报错。
+        # Vision Encoder 输出 FP16，Connector 默认 FP32，Linear 不兼容。
+        self.connector = self.connector.to(dtype=self.language_model.dtype)
+
         # 设置 <image> token
         self._setup_image_token()
+
+        # AnyRes 动态高分辨率处理器（LLaVA-NeXT 1.6）
+        # enabled=False 时等价于原始单图模式，保留学习路线
+        self.anyres_processor = AnyResProcessor(
+            base_size=config.anyres.base_size,
+            image_processor=self.vision_encoder.processor,
+            grid_configs=list(config.anyres.grid_configs),
+            max_tiles=config.anyres.max_tiles,
+            enabled=config.anyres.enabled,
+        )
 
         # 当前训练阶段
         self._stage = "stage1"
@@ -99,12 +114,19 @@ class NanoVLM(nn.Module):
         # 3. 通过MLP投影到LLM空间
         visual_embeddings = self.connector(patch_features)
 
+        # 数值稳定性守卫：检测并钳制极端值（防止 FP16 attention 溢出）
+        if self.training:
+            vis_max = visual_embeddings.abs().max().item()
+            if vis_max > 50:  # FP16 安全阈值，远低于 65504
+                print(f"[WARNING] Connector output max={vis_max:.1f}, clamping to ±50")
+                visual_embeddings = visual_embeddings.clamp(-50, 50)
+
         return visual_embeddings
 
     def prepare_inputs_embeds(
         self,
         input_ids: torch.Tensor,
-        visual_embeddings: torch.Tensor,
+        visual_embeddings,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -114,14 +136,18 @@ class NanoVLM(nn.Module):
         - 找到 input_ids 中所有 <image> token 的位置
         - 用 visual_embeddings 替换这些位置
 
+        visual_embeddings 支持两种格式（向后兼容）：
+        - Tensor (B, N_v, hidden)：原始单图模式，每样本等长
+        - List[Tensor]：AnyRes 模式，每样本可以不等长 [(N_v1, hidden), (N_v2, hidden), ...]
+
         Args:
             input_ids: (B, L) - 文本token序列（包含<image>占位符）
-            visual_embeddings: (B, N_v, llm_hidden_size) - 视觉embedding
+            visual_embeddings: (B, N_v, hidden) 或 List[(N_vi, hidden)]
             attention_mask: (B, L) - 注意力mask
 
         Returns:
-            inputs_embeds: (B, L', llm_hidden_size) - 混合后的embedding
-            attention_mask: (B, L') - 调整后的attention_mask
+            inputs_embeds: (B, L, llm_hidden_size) - 混合后的embedding
+            attention_mask: (B, L) - attention_mask
         """
         # 获取文本embedding层
         embed_tokens = self.language_model.get_input_embeddings()
@@ -141,28 +167,28 @@ class NanoVLM(nn.Module):
             if num_image_tokens == 0:
                 continue
 
-            # 视觉embedding的数量
-            num_vis_tokens = visual_embeddings.shape[1]  # 例如 576
+            # visual_embeddings[b] 对 Tensor 和 List 都适用
+            vis_emb = visual_embeddings[b]  # (N_v_i, hidden)
+            num_vis_tokens = vis_emb.shape[0]
 
             if num_image_tokens != num_vis_tokens:
-                # 如果<image> token数量不等于视觉token数量，需要处理
-                # 最简单的方式：将多个<image>展平为多个视觉token
-                # 这里假设 input_ids 中 <image> 的数量和视觉patch数一致
-                # 如果不一致，做截断或填充
+                # 如果<image> token数量不等于视觉token数量，做截断或填充
                 if num_image_tokens < num_vis_tokens:
                     # 视觉token更多：截断多余的视觉token
-                    visual_embeds_used = visual_embeddings[b, :num_image_tokens, :]
+                    vis_emb = vis_emb[:num_image_tokens]
                 else:
-                    # <image> token更多：复制最后的视觉token填充
-                    visual_embeds_used = visual_embeddings[b]
-                    # 前面num_vis_tokens个位置用视觉embedding
-                    # 多余的<image>位置用零填充（或padding embedding）
-                    pass
-            else:
-                visual_embeds_used = visual_embeddings[b]
+                    # <image> token更多：多余位置填零
+                    padding = torch.zeros(
+                        num_image_tokens - num_vis_tokens, text_embeds.shape[-1],
+                        device=text_embeds.device, dtype=text_embeds.dtype,
+                    )
+                    vis_emb = torch.cat([vis_emb, padding], dim=0)
+            elif num_image_tokens == num_vis_tokens:
+                pass  # 数量匹配，直接使用
 
             # 替换: 在 <image> token 的位置填入视觉 embedding
-            text_embeds[b, image_positions] = visual_embeds_used.to(text_embeds.dtype)
+            text_embeds = text_embeds.clone()
+            text_embeds[b, image_positions] = vis_emb.to(text_embeds.dtype)
 
         return text_embeds, attention_mask
 
@@ -173,16 +199,21 @@ class NanoVLM(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         images: Optional[torch.Tensor] = None,
+        image_counts: Optional[List[int]] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
         完整前向传播
 
         Args:
-            pixel_values: (B, 3, H, W) - 预处理后的图像（别名: images）
+            pixel_values: 图像张量
+                - 原始单图模式: (B, 3, H, W)
+                - AnyRes 模式: (total_sub_images, 3, H, W) — 所有样本的全部 tile 展平
             input_ids: (B, L) - 文本token序列
             attention_mask: (B, L) - 注意力mask
             labels: (B, L) - 训练标签
+            image_counts: List[int] — 每个样本包含几个 sub-image（缩略图+tiles）。
+                为 None 时使用原始单图模式（向后兼容）。
 
         Returns:
             dict with keys:
@@ -196,6 +227,23 @@ class NanoVLM(nn.Module):
         # 1. 编码图像
         if pixel_values is not None:
             visual_embeddings = self.encode_images(pixel_values)
+            # 原始单图模式: (B, 729, 896)
+            # AnyRes 展平后: (total_sub_images, 729, 896)
+
+            # AnyRes 路径：按 image_counts 拆分并拼接每个样本的 visual tokens
+            if image_counts is not None and self.config.anyres.enabled:
+                vis_emb_list = []
+                start = 0
+                for count in image_counts:
+                    # 取出该样本的 count 个 sub-image 的 visual tokens
+                    sample_vis = visual_embeddings[start:start + count]
+                    # 拼接为一个序列: (count, 729, 896) → (count * 729, 896)
+                    sample_vis = sample_vis.reshape(-1, sample_vis.shape[-1])
+                    vis_emb_list.append(sample_vis)
+                    start += count
+                visual_embeddings = vis_emb_list
+                # visual_embeddings 现在是 List[(N_v1, 896), (N_v2, 896), ...]
+            # 否则 visual_embeddings 保持为 (B, 729, 896) — 原始单图模式
         else:
             visual_embeddings = None
 
@@ -207,6 +255,11 @@ class NanoVLM(nn.Module):
                 attention_mask=attention_mask,
             )
 
+            # NaN 诊断 1：inputs_embeds 是否已含 NaN
+            if torch.isnan(inputs_embeds).any() or torch.isinf(inputs_embeds).any():
+                print(f"[DIAG] NaN/Inf in inputs_embeds BEFORE LLM! "
+                      f"shape={inputs_embeds.shape}, max={inputs_embeds.abs().max().item():.1f}", flush=True)
+
             # 3. 通过语言模型
             outputs = self.language_model(
                 input_ids=None,  # 不使用input_ids，直接传embedding
@@ -215,6 +268,20 @@ class NanoVLM(nn.Module):
                 labels=labels,
                 **kwargs,
             )
+
+            # NaN 诊断 2：logits 是否含 NaN
+            if labels is not None:
+                logits = outputs.logits
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    nan_ratio = torch.isnan(logits).float().mean().item()
+                    print(f"[DIAG] NaN/Inf in LOGITS! nan_ratio={nan_ratio:.4f}, "
+                          f"logits_max={logits[~torch.isnan(logits)].abs().max().item():.1f}, "
+                          f"inputs_embeds_max={inputs_embeds.abs().max().item():.1f}", flush=True)
+
+            # 防御：labels 全为 -100 时（AnyRes 把文本挤出了 max_seq_length），返回 0 loss
+            if labels is not None and (labels != -100).sum() == 0:
+                outputs.loss = torch.tensor(0.0, device=outputs.logits.device,
+                                            dtype=outputs.logits.dtype, requires_grad=True)
         else:
             # 纯文本模式（无图像）
             outputs = self.language_model(
@@ -273,6 +340,7 @@ class NanoVLM(nn.Module):
                 "vision": asdict(self.config.vision),
                 "language": asdict(self.config.language),
                 "connector": asdict(self.config.connector),
+                "anyres": asdict(self.config.anyres),
                 "image_token": self.config.image_token,
                 "image_token_id": self.config.image_token_id,
             }
@@ -314,6 +382,8 @@ class NanoVLM(nn.Module):
             vision=VisionConfig(**config_dict["vision"]),
             language=LanguageConfig(**config_dict["language"]),
             connector=ConnectorConfig(**config_dict["connector"]),
+            # anyres 向后兼容：旧 checkpoint 没有此字段时使用默认值
+            anyres=AnyResConfig(**config_dict["anyres"]) if "anyres" in config_dict else AnyResConfig(),
         )
         config.image_token = config_dict["image_token"]
         config.image_token_id = config_dict["image_token_id"]
@@ -324,7 +394,13 @@ class NanoVLM(nn.Module):
         # 加载 connector 权重
         connector_path = os.path.join(save_dir, "connector.bin")
         if os.path.exists(connector_path):
-            model.connector.load_state_dict(torch.load(connector_path, map_location="cpu"))
+            state_dict = torch.load(connector_path, map_location="cpu")
+            # strict=False: 兼容旧 checkpoint（没有 norm.weight 时使用新初始化的默认值）
+            missing, unexpected = model.connector.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"[NanoVLM] Connector missing keys (using defaults): {missing}")
+            # connector 训练时保存为 float32，需要转换到与视觉/语言模型一致的 dtype
+            model.connector.to(model.language_model.dtype)
             print(f"[NanoVLM] Loaded connector from: {connector_path}")
 
         # 加载 LoRA 权重（Stage 2）

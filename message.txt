@@ -1,3 +1,0 @@
-完成了stage1的训练流程 把参数配置修改成适合siglip的形式
-增加了tf日志记录
-优化了checkpoint保存的东西，静态文件只保留一次，并且stage2中不只保留connecter的权重

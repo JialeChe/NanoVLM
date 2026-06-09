@@ -2,3 +2,5 @@ models/
 data/
 checkpoints/
 __pycache__/
+.claude/
+.vscode/

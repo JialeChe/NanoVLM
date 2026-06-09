@@ -50,6 +50,11 @@ class Connector(nn.Module):
 
         self.mlp = nn.Sequential(*layers)
 
+        # 输出归一化：将视觉 embedding 约束到与 LLM token embedding 相同的量级
+        # Qwen2 内部使用 RMSNorm，这里保持一致。没有这个层，Connector 输出可能
+        # 达到 ±5700，远超 token embedding 的 ±1 范围，导致 FP16 attention 溢出。
+        self.norm = nn.RMSNorm(config.llm_hidden_size, eps=1e-6)
+
         # 初始化权重（xavier正态分布）
         self._init_weights()
 
@@ -65,14 +70,14 @@ class Connector(nn.Module):
         """
         Args:
             vision_features: (B, num_vision_tokens, vision_hidden_size)
-                - 来自CLIP ViT的 patch features
-                - 通常去掉CLS token，用 patch tokens: [:, 1:, :]
 
         Returns:
             language_embeddings: (B, num_vision_tokens, llm_hidden_size)
-                - 投影后的特征，可直接拼接到语言模型的embedding序列中
+                MLP 投影 → RMSNorm → 输出，值域与 LLM token embedding 一致
         """
-        return self.mlp(vision_features)
+        x = self.mlp(vision_features)
+        x = self.norm(x)
+        return x
 
     def get_output_dim(self) -> int:
         """返回输出维度"""

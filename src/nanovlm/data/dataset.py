@@ -27,7 +27,12 @@ from .conversation import Conversation
 
 
 class LLaVADataset(Dataset):
-    """LLaVA格式多模态对话数据集"""
+    """LLaVA格式多模态对话数据集
+
+    支持两种图像处理模式（保留学习路线）：
+    - 原始单图模式（默认）：resize → 384×384，每个样本 1 个 sub-image
+    - AnyRes 模式（可选）：动态高分辨率切分，每个样本 1+G² 个 sub-image
+    """
 
     def __init__(
         self,
@@ -38,16 +43,19 @@ class LLaVADataset(Dataset):
         num_image_tokens: int,
         max_seq_length: int = 2048,
         image_base_dir: Optional[str] = None,
+        anyres_processor=None,  # ← 新增：AnyRes 处理器
     ):
         """
         Args:
             data_path: JSON 数据文件路径
             tokenizer: 语言模型 tokenizer
-            image_processor: CLIP 图像预处理器
+            image_processor: 图像预处理器（如 SigLIP AutoImageProcessor）
             image_token_id: <image> token 的 id
-            num_image_tokens: 图像占位 token 数量
+            num_image_tokens: 图像占位 token 数量（原始单图模式使用）
             max_seq_length: 最大序列长度
             image_base_dir: 图像文件根目录（如果JSON中用的是相对路径）
+            anyres_processor: AnyResProcessor 实例。None 或 enabled=False 时
+                             使用原始单图模式（向后兼容）。
         """
         super().__init__()
 
@@ -57,11 +65,21 @@ class LLaVADataset(Dataset):
         self.num_image_tokens = num_image_tokens
         self.max_seq_length = max_seq_length
 
+        # AnyRes 处理器（可选）
+        self.anyres_processor = anyres_processor
+        self._use_anyres = (
+            anyres_processor is not None and anyres_processor.enabled
+        )
+
         # 加载 JSON 数据
         with open(data_path, "r", encoding="utf-8") as f:
             self.data = json.load(f)
 
         print(f"[Dataset] Loaded {len(self.data)} samples from {data_path}")
+        if self._use_anyres:
+            print(f"[Dataset] AnyRes mode enabled (max_tiles={anyres_processor.max_tiles})")
+        else:
+            print(f"[Dataset] Single-image mode (original LLaVA 1.0/1.5 path)")
 
         # 确定图像目录
         if image_base_dir:
@@ -106,10 +124,22 @@ class LLaVADataset(Dataset):
         image_path = sample.get("image", None)
         if image_path:
             image = self.load_image(image_path)
-            pixel_values = self.process_image(image)
+
+            if self._use_anyres:
+                # ── AnyRes 路径（LLaVA-NeXT 1.6）─────────────────────
+                # 返回 (N_sub_images, 3, 384, 384) + 动态 visual token 数
+                pixel_values, num_sub_images = self.anyres_processor.process(image)
+                # num_vis_tokens = num_sub_images × (384/14)² = num_sub_images × 729
+                num_vis_tokens = num_sub_images * self.num_image_tokens
+            else:
+                # ── 原始单图路径（LLaVA 1.0/1.5）─────────────────────
+                # 直接 resize 到 384×384
+                pixel_values = self.process_image(image)  # (3, 384, 384)
+                num_vis_tokens = self.num_image_tokens  # 729
         else:
             # 无图像样本（纯文本对话）
             pixel_values = None
+            num_vis_tokens = 0
 
         # 2. 处理对话文本
         conversations = sample["conversations"]
@@ -118,7 +148,7 @@ class LLaVADataset(Dataset):
             tokenizer=self.tokenizer,
             max_length=self.max_seq_length,
             image_token_id=self.image_token_id,
-            num_image_tokens=self.num_image_tokens,
+            num_image_tokens=num_vis_tokens,  # 使用动态值
             is_training=True,
         )
 
@@ -129,7 +159,9 @@ class LLaVADataset(Dataset):
         }
 
         if pixel_values is not None:
-            result["pixel_values"] = pixel_values
+            result["pixel_values"] = pixel_values  # 单图: (3,384,384); AnyRes: (N,3,384,384)
+            if self._use_anyres:
+                result["image_counts"] = pixel_values.shape[0]  # sub-image 数量
 
         return result
 

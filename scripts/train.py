@@ -75,6 +75,18 @@ def main():
         default=None,
         help="Resume training from a checkpoint directory (e.g., checkpoints/stage1_step_55000)",
     )
+    parser.add_argument(
+        "--anyres",
+        action="store_true",
+        default=False,
+        help="Enable AnyRes dynamic high-resolution (LLaVA-NeXT 1.6 mode)",
+    )
+    parser.add_argument(
+        "--anyres_max_tiles",
+        type=int,
+        default=4,
+        help="Max tiles for AnyRes (default: 4, i.e. up to 2x2 grid)",
+    )
 
     args = parser.parse_args()
 
@@ -93,6 +105,22 @@ def main():
     training_config = TrainingConfig()
     training_config.output_dir = args.output_dir
 
+    # AnyRes 配置
+    if args.anyres:
+        model_config.anyres.enabled = True
+        model_config.anyres.max_tiles = args.anyres_max_tiles
+        training_config.stage1.anyres_enabled = True
+        training_config.stage2.anyres_enabled = True
+
+        # AnyRes 的 visual token 数 = (1+max_tiles) × 729。
+        # 例如 max_tiles=4: 5×729=3645 tokens，远超默认的 2048。
+        # 自动提升 max_seq_length 到至少 4096，否则 assistant 回复会被截断。
+        min_seq_len = (1 + args.anyres_max_tiles) * 729 + 256  # visual + text overhead
+        if args.max_seq_length < min_seq_len:
+            print(f"\n[AnyRes] max_seq_length {args.max_seq_length} → {max(min_seq_len, 4096)} "
+                  f"(visual tokens need {(1+args.anyres_max_tiles)*729}, default 2048 too small)")
+            args.max_seq_length = max(min_seq_len, 4096)
+
     print("\n" + "=" * 60)
     print("NanoVLM Model Configuration")
     print("=" * 60)
@@ -100,6 +128,10 @@ def main():
     print(f"  Language: {model_config.language.model_name_or_path}")
     print(f"  Image size: {model_config.vision.image_size}")
     print(f"  MLP hidden: {model_config.connector.mlp_hidden_size}")
+    print(f"  AnyRes: {'enabled' if model_config.anyres.enabled else 'disabled (original LLaVA 1.0/1.5 mode)'}")
+    if model_config.anyres.enabled:
+        print(f"    Max tiles: {model_config.anyres.max_tiles}")
+        print(f"    Grid configs: {model_config.anyres.grid_configs}")
     print("=" * 60)
 
     # 创建模型
@@ -123,6 +155,7 @@ def main():
         num_image_tokens=num_image_tokens,
         max_seq_length=args.max_seq_length,
         image_base_dir=args.image_dir,
+        anyres_processor=model.anyres_processor,  # 传入 AnyRes processor（启用时有效）
     )
     print(f"Dataset size: {len(dataset)}")
 

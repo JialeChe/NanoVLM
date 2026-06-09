@@ -61,6 +61,10 @@ class VLMGenerator:
         """
         根据图像和问题生成回答
 
+        支持两种图像处理模式：
+        - 原始单图：resize 到 384×384（向后兼容）
+        - AnyRes：动态高分辨率切分（需 anyres.enabled=True）
+
         Args:
             image: PIL Image 或图片路径
             question: 用户问题
@@ -73,13 +77,50 @@ class VLMGenerator:
         if max_new_tokens is None:
             max_new_tokens = self.max_new_tokens
 
+        # 检查是否启用 AnyRes
+        use_anyres = (
+            hasattr(self.model, 'anyres_processor') and
+            self.model.anyres_processor.enabled
+        )
+
+        # 0. 预先确定 visual token 数量（需要先处理好图像才能知道）
+        if image is not None:
+            if isinstance(image, str):
+                image = Image.open(image).convert("RGB")
+
+            if use_anyres:
+                # AnyRes 路径：动态切分图像
+                pixel_values, num_sub_images = self.model.anyres_processor.process(image)
+                # pixel_values: (N_sub, 3, 384, 384)
+                # num_vis_tokens = num_sub_images × 729
+                num_vis_tokens_per_patch = self.model.vision_encoder.get_num_patches()
+                num_vis_tokens = num_sub_images * num_vis_tokens_per_patch
+                pixel_values = pixel_values.to(self.device)
+                image_counts = [num_sub_images]
+            else:
+                # 原始单图路径
+                processed = self.image_processor(
+                    images=image,
+                    return_tensors="pt",
+                )
+                pixel_values = processed["pixel_values"].to(self.device)
+                # pixel_values: (1, 3, 384, 384)
+                num_vis_tokens = self.model.vision_encoder.get_num_patches()
+                image_counts = None
+        else:
+            pixel_values = None
+            num_vis_tokens = self.model.vision_encoder.get_num_patches()
+            image_counts = None
+
         # 1. 构建对话
         if conversations is None:
             if question is None:
                 raise ValueError("Either 'question' or 'conversations' must be provided")
 
+            if "<image>" not in question:
+                question = f"<image>\n{question}"
             conversations = [
-                {"from": "human", "value": f"<image>\n{question}"},
+                {"from": "human", "value": question},
             ]
 
         # 构建输入文本（包含 system + user，添加 generation prompt）
@@ -89,25 +130,11 @@ class VLMGenerator:
             add_generation_prompt=True,
         )
 
-        # 替换 <image> 为多个 image_token
-        num_vis_tokens = self.model.vision_encoder.get_num_patches()
+        # 替换 <image> 为 num_vis_tokens 个 image_token
         image_token_str = self.tokenizer.decode([self.image_token_id])
         prompt = prompt.replace("<image>", image_token_str * num_vis_tokens)
 
-        # 2. 处理图像
-        if image is not None:
-            if isinstance(image, str):
-                image = Image.open(image).convert("RGB")
-
-            processed = self.image_processor(
-                images=image,
-                return_tensors="pt",
-            )
-            pixel_values = processed["pixel_values"].to(self.device)
-        else:
-            pixel_values = None
-
-        # 3. Tokenize 输入
+        # 2. Tokenize 输入
         inputs = self.tokenizer(
             prompt,
             return_tensors="pt",
@@ -116,14 +143,29 @@ class VLMGenerator:
         input_ids = inputs["input_ids"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
 
-        # 4. 编码图像获取视觉 embedding
+        # 3. 编码图像获取视觉 embedding
         if pixel_values is not None:
             with torch.no_grad():
                 visual_embeddings = self.model.encode_images(pixel_values)
+            # visual_embeddings:
+            #   原始单图: (1, 729, 896)
+            #   AnyRes:   (N_sub, 729, 896)
+
+            # AnyRes 路径：将 sub-image embeddings 拼接为单样本序列
+            if use_anyres and image_counts is not None:
+                vis_emb_list = []
+                start = 0
+                for count in image_counts:
+                    sample_vis = visual_embeddings[start:start + count]
+                    sample_vis = sample_vis.reshape(-1, sample_vis.shape[-1])
+                    vis_emb_list.append(sample_vis)
+                    start += count
+                visual_embeddings = vis_emb_list
+                # visual_embeddings = [(count*729, 896)]
         else:
             visual_embeddings = None
 
-        # 5. 构建混合 embedding
+        # 4. 构建混合 embedding
         if visual_embeddings is not None:
             inputs_embeds, attention_mask = self.model.prepare_inputs_embeds(
                 input_ids=input_ids,
@@ -134,7 +176,7 @@ class VLMGenerator:
             embed_tokens = self.model.language_model.get_input_embeddings()
             inputs_embeds = embed_tokens(input_ids)
 
-        # 6. 自回归生成
+        # 5. 自回归生成
         generated_ids = self._generate_from_embeds(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -142,7 +184,7 @@ class VLMGenerator:
             input_ids=input_ids,
         )
 
-        # 7. 解码
+        # 6. 解码
         output_ids = generated_ids[0, input_ids.shape[1]:]
         response = self.tokenizer.decode(output_ids, skip_special_tokens=True)
 
